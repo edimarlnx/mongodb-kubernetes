@@ -16,6 +16,7 @@ import (
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
 	"go.uber.org/zap"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/rest"
@@ -26,11 +27,12 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/manager"
 	"sigs.k8s.io/controller-runtime/pkg/manager/signals"
 
+	localruntime "runtime"
+
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	corev1 "k8s.io/api/core/v1"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
-	localruntime "runtime"
 	ctrl "sigs.k8s.io/controller-runtime"
 	runtime_cluster "sigs.k8s.io/controller-runtime/pkg/cluster"
 	kubelog "sigs.k8s.io/controller-runtime/pkg/log"
@@ -41,6 +43,9 @@ import (
 	mdbv1 "github.com/mongodb/mongodb-kubernetes/api/v1/mdb"
 	mdbmultiv1 "github.com/mongodb/mongodb-kubernetes/api/v1/mdbmulti"
 	omv1 "github.com/mongodb/mongodb-kubernetes/api/v1/om"
+	"github.com/mongodb/mongodb-kubernetes/api/v1/role"
+	"github.com/mongodb/mongodb-kubernetes/api/v1/search"
+	"github.com/mongodb/mongodb-kubernetes/api/v1/user"
 	"github.com/mongodb/mongodb-kubernetes/controllers/operator"
 	"github.com/mongodb/mongodb-kubernetes/controllers/operator/construct"
 	"github.com/mongodb/mongodb-kubernetes/controllers/searchcontroller"
@@ -178,6 +183,42 @@ func main() {
 		}
 		managerOptions.Cache = cache.Options{
 			DefaultNamespaces: defaultNamespaces,
+		}
+	}
+	labelSelector, wlbsSpecified := os.LookupEnv(util.WatchLabelSelectorEnv)
+	if wlbsSpecified {
+		log.Infof("Watching resources with label selector: %s", labelSelector)
+		parsedSelector, err := labels.Parse(labelSelector)
+		if err != nil {
+			log.Fatalf("unable to parse label selector to watch: %v", err)
+		}
+		managerOptions.NewCache = func(cfg *rest.Config, opts cache.Options) (cache.Cache, error) {
+			log.Infof("Creating cache with label selector to watch: %s", parsedSelector)
+			crdToObjectMap := map[string]client.Object{
+				mongoDBCRDPlural:            &mdbv1.MongoDB{},
+				mongoDBUserCRDPlural:        &user.MongoDBUser{},
+				mongoDBOpsManagerCRDPlural:  &omv1.MongoDBOpsManager{},
+				mongoDBCommunityCRDPlural:   &mcov1.MongoDBCommunity{},
+				mongoDBSearchCRDPlural:      &search.MongoDBSearch{},
+				clusterMongoDBRoleCRDPlural: &role.ClusterMongoDBRole{},
+			}
+			if opts.ByObject == nil {
+				opts.ByObject = make(map[client.Object]cache.ByObject)
+			}
+			for _, crd := range crds {
+				if obj, exists := crdToObjectMap[crd]; exists {
+					if existing, hasExisting := opts.ByObject[obj]; hasExisting {
+						existing.Label = parsedSelector
+						opts.ByObject[obj] = existing
+					} else {
+						opts.ByObject[obj] = cache.ByObject{
+							Label: parsedSelector,
+						}
+					}
+					log.Infof("Applied label selector to %s resources", crd)
+				}
+			}
+			return cache.New(cfg, opts)
 		}
 	}
 
